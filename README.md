@@ -2,7 +2,7 @@
 Tools for evaluating and visualizing results for the Multi Object Tracking and Segmentation (MOTS) task
 
 ## Project website (including annotations)
-https://www.vision.rwth-aachen.de/publication/00178/
+https://www.vision.rwth-aachen.de/page/mots
 
 ## Paper
 https://www.vision.rwth-aachen.de/media/papers/mots-multi-object-tracking-and-segmentation/MOTS.pdf
