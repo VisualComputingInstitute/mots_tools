@@ -1,6 +1,8 @@
 # mots_tools
 Tools for evaluating and visualizing results for the Multi Object Tracking and Segmentation (MOTS) task.
 
+For the TrackR-CNN code please visit https://github.com/VisualComputingInstitute/TrackR-CNN
+
 ## Project website (including annotations)
 https://www.vision.rwth-aachen.de/page/mots
 
@@ -41,3 +43,8 @@ If you use this code, please cite:
 
 ## License
 MIT License
+
+## Contact
+If you find a problem in the code, please open an issue.
+
+For general questions, please contact Paul Voigtlaender (voigtlaender@vision.rwth-aachen.de) or Michael Krause (michael.krause@rwth-aachen.de)
