@@ -38,6 +38,7 @@ class MOTSResults:
     self.ML = 0
     self.IDF1 = 0
     self.IDTP = 0
+    self.id_n_tr = 0
 
 
 # go through all frames and associate ground truth and tracker results
@@ -59,6 +60,8 @@ def compute_MOTS_metrics_per_sequence(seq_name, gt_seq, results_seq, max_frames,
 
   n_gts = 0
   n_trs = 0
+
+  frame_to_ignore_region = {}
 
   # Iterate over frames in this sequence
   for f in range(max_frames + 1):
@@ -82,6 +85,7 @@ def compute_MOTS_metrics_per_sequence(seq_name, gt_seq, results_seq, max_frames,
     # Handle ignore regions as one large ignore region
     dc = SegmentedObject(mask=rletools.merge([d.mask for d in dc], intersect=False),
                          class_id=ignore_class, track_id=ignore_class)
+    frame_to_ignore_region[f] = dc
 
     tracks_valid = [False for _ in range(len(t))]
 
@@ -234,9 +238,12 @@ def compute_MOTS_metrics_per_sequence(seq_name, gt_seq, results_seq, max_frames,
         results_obj.PT += 1
 
     # compute IDF1
-    idf1, idtp = compute_idf1_and_idtp_for_sequence(gt_seq, results_seq, gt_track_ids, tr_track_ids)
+    idf1, idtp, id_n_tr = compute_idf1_and_idtp_for_sequence(gt_seq, results_seq, gt_track_ids, tr_track_ids,
+                                                             frame_to_ignore_region)
     results_obj.IDF1 = idf1
     results_obj.IDTP = idtp
+    #results_obj.id_ign = id_ign
+    results_obj.id_n_tr = id_n_tr
   return results_obj
 
 
@@ -324,7 +331,7 @@ def compute_prec_rec_clearmot(results_obj):
   if results_obj.n_gt_trajectories == 0:
     results_obj.IDF1 = 0.
   else:
-    results_obj.IDF1 = (2 * results_obj.IDTP) / (results_obj.n_gt + results_obj.n_tr)
+    results_obj.IDF1 = (2 * results_obj.IDTP) / (results_obj.n_gt + results_obj.id_n_tr)
   return results_obj
 
 
@@ -414,7 +421,15 @@ def print_entry(key, val, width=(70, 10)):
 
 ### IDF1 stuff
 ### code below adapted from https://github.com/shenh10/mot_evaluation/blob/5dd51e5cb7b45992774ea150e4386aa0b02b586f/utils/measurements.py
-def compute_idf1_and_idtp_for_sequence(frame_to_gt, frame_to_pred, gt_ids, st_ids):
+def compute_idf1_and_idtp_for_sequence(frame_to_gt, frame_to_pred, gt_ids, st_ids, frame_to_ignore_region):
+  frame_to_can_be_ignored = {}
+  for t in frame_to_pred.keys():
+    preds_t = frame_to_pred[t]
+    pred_masks_t = [p.mask for p in preds_t]
+    ignore_region_t = frame_to_ignore_region[t].mask
+    overlap = np.squeeze(rletools.iou(pred_masks_t, [ignore_region_t], [1]), axis=1)
+    frame_to_can_be_ignored[t] = overlap > 0.5
+
   gt_ids = sorted(gt_ids)
   st_ids = sorted(st_ids)
   groundtruth = [[] for _ in gt_ids]
@@ -423,10 +438,13 @@ def compute_idf1_and_idtp_for_sequence(frame_to_gt, frame_to_pred, gt_ids, st_id
     for gt_t in gts_t:
       if gt_t.track_id in gt_ids:
         groundtruth[gt_ids.index(gt_t.track_id)].append((t, gt_t))
-  for t, preds_t in frame_to_pred.items():
-    for pred_t in preds_t:
+  for t in frame_to_pred.keys():
+    preds_t = frame_to_pred[t]
+    can_be_ignored_t = frame_to_can_be_ignored[t]
+    assert len(preds_t) == len(can_be_ignored_t)
+    for pred_t, ign_t in zip(preds_t, can_be_ignored_t):
       if pred_t.track_id in st_ids:
-        prediction[st_ids.index(pred_t.track_id)].append((t, pred_t))
+        prediction[st_ids.index(pred_t.track_id)].append((t, pred_t, ign_t))
   for gt in groundtruth:
     gt.sort(key=lambda x: x[0])
   for pred in prediction:
@@ -440,19 +458,24 @@ def compute_idf1_and_idtp_for_sequence(frame_to_gt, frame_to_pred, gt_ids, st_id
 
   fp = np.zeros(cost.shape)
   fn = np.zeros(cost.shape)
+  ign = np.zeros(cost.shape)
   # cost matrix of all trajectory pairs
-  cost_block, fp_block, fn_block = cost_between_gt_pred(groundtruth, prediction)
+  cost_block, fp_block, fn_block, ign_block = cost_between_gt_pred(groundtruth, prediction)
   cost[:n_gt, :n_st] = cost_block
   fp[:n_gt, :n_st] = fp_block
   fn[:n_gt, :n_st] = fn_block
+  ign[:n_gt, :n_st] = ign_block
 
   # computed trajectory match no groundtruth trajectory, FP
   for i in range(n_st):
     #cost[i + n_gt, i] = prediction[i].shape[0]
     #fp[i + n_gt, i] = prediction[i].shape[0]
-    # TODO: don't count fp in case of ignore region?
-    cost[i + n_gt, i] = len(prediction[i])
-    fp[i + n_gt, i] = len(prediction[i])
+    # don't count fp in case of ignore region
+    fps = sum([~x[2] for x in prediction[i]])
+    ig = sum([x[2] for x in prediction[i]])
+    cost[i + n_gt, i] = fps
+    fp[i + n_gt, i] = fps
+    ign[i + n_gt, i] = ig
 
   # groundtruth trajectory match no computed trajectory, FN
   for i in range(n_gt):
@@ -465,20 +488,26 @@ def compute_idf1_and_idtp_for_sequence(frame_to_gt, frame_to_pred, gt_ids, st_id
   #nbox_gt = sum([groundtruth[i].shape[0] for i in range(n_gt)])
   #nbox_st = sum([prediction[i].shape[0] for i in range(n_st)])
   nbox_gt = sum([len(groundtruth[i]) for i in range(n_gt)])
+
   nbox_st = sum([len(prediction[i]) for i in range(n_st)])
 
-  IDFP = 0
+  #IDFP = 0
   IDFN = 0
+  id_ign = 0
   for matched in zip(*matched_indices):
-    IDFP += fp[matched[0], matched[1]]
+    #IDFP += fp[matched[0], matched[1]]
     IDFN += fn[matched[0], matched[1]]
+    # exclude detections which are not matched and ignored from total count
+    id_ign += ign[matched[0], matched[1]]
+  id_n_tr = nbox_st - id_ign
+
   IDTP = nbox_gt - IDFN
-  assert IDTP == nbox_st - IDFP
+  #assert IDTP == nbox_st - IDFP
   #IDP = IDTP / (IDTP + IDFP) * 100  # IDP = IDTP / (IDTP + IDFP)
   #IDR = IDTP / (IDTP + IDFN) * 100  # IDR = IDTP / (IDTP + IDFN)
   # IDF1 = 2 * IDTP / (2 * IDTP + IDFP + IDFN)
-  IDF1 = 2 * IDTP / (nbox_gt + nbox_st)
-  return IDF1, IDTP
+  IDF1 = 2 * IDTP / (nbox_gt + id_n_tr)
+  return IDF1, IDTP, id_n_tr
 
 
 def cost_between_gt_pred(groundtruth, prediction):
@@ -487,11 +516,12 @@ def cost_between_gt_pred(groundtruth, prediction):
   cost = np.zeros((n_gt, n_st), dtype=float)
   fp = np.zeros((n_gt, n_st), dtype=float)
   fn = np.zeros((n_gt, n_st), dtype=float)
+  ign = np.zeros((n_gt, n_st), dtype=float)
   for i in range(n_gt):
     for j in range(n_st):
-      fp[i, j], fn[i, j] = cost_between_trajectories(groundtruth[i], prediction[j])
+      fp[i, j], fn[i, j], ign[i, j] = cost_between_trajectories(groundtruth[i], prediction[j])
       cost[i, j] = fp[i, j] + fn[i, j]
-  return cost, fp, fn
+  return cost, fp, fn, ign
 
 
 def cost_between_trajectories(traj1, traj2):
@@ -511,14 +541,19 @@ def cost_between_trajectories(traj1, traj2):
   end1 = max(times1)
   end2 = max(times2)
 
+  ign = [traj2[i][2] for i in range(npoints2)]
+
   # check frame overlap
   #has_overlap = max(start1, start2) < min(end1, end2)
   # careful, changed this to <=, but I think now it's right
   has_overlap = max(start1, start2) <= min(end1, end2)
   if not has_overlap:
     fn = npoints1
-    fp = npoints2
-    return fp, fn
+    #fp = npoints2
+    # disregard detections which can be ignored
+    fp = sum([~x for x in ign])
+    ig = sum(ign)
+    return fp, fn, ig
 
   # gt trajectory mapping to st, check gt missed
   matched_pos1 = corresponding_frame(times1, npoints1, times2, npoints2)
@@ -529,9 +564,12 @@ def cost_between_trajectories(traj1, traj2):
   # FN
   fn = sum([1 for i in range(npoints1) if overlap1[i] < 0.5])
   # FP
-  # TODO: don't count false positive in case of ignore region?
-  fp = sum([1 for i in range(npoints2) if overlap2[i] < 0.5])
-  return fp, fn
+  # don't count false positive in case of ignore region
+  unmatched = [overlap2[i] < 0.5 for i in range(npoints2)]
+  #fp = sum([1 for i in range(npoints2) if overlap2[i] < 0.5 and not traj2[i][2]])
+  fp = sum([1 for i in range(npoints2) if unmatched[i] and not ign[i]])
+  ig = sum([1 for i in range(npoints2) if unmatched[i] and ign[i]])
+  return fp, fn, ig
 
 
 def corresponding_frame(traj1, len1, traj2, len2):
