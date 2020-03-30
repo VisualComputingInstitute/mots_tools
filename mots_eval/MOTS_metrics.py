@@ -1,4 +1,7 @@
 import math
+import sys
+import numpy as np
+from scipy.optimize import linear_sum_assignment as linear_assignment
 from collections import defaultdict
 import pycocotools.mask as rletools
 from mots_common.io import SegmentedObject
@@ -33,6 +36,8 @@ class MOTSResults:
     self.MT = 0
     self.PT = 0
     self.ML = 0
+    self.IDF1 = 0
+    self.IDTP = 0
 
 
 # go through all frames and associate ground truth and tracker results
@@ -228,6 +233,10 @@ def compute_MOTS_metrics_per_sequence(seq_name, gt_seq, results_seq, max_frames,
       else:  # 0.2 <= tracking_ratio <= 0.8
         results_obj.PT += 1
 
+    # compute IDF1
+    idf1, idtp = compute_idf1_and_idtp_for_sequence(gt_seq, results_seq, gt_track_ids, tr_track_ids)
+    results_obj.IDF1 = idf1
+    results_obj.IDTP = idtp
   return results_obj
 
 
@@ -311,12 +320,18 @@ def compute_prec_rec_clearmot(results_obj):
     results_obj.PT /= float(results_obj.n_gt_trajectories)
     results_obj.ML /= float(results_obj.n_gt_trajectories)
 
+  # IDF1
+  if results_obj.n_gt_trajectories == 0:
+    results_obj.IDF1 = 0.
+  else:
+    results_obj.IDF1 = (2 * results_obj.IDTP) / (results_obj.n_gt + results_obj.n_tr)
   return results_obj
 
 
 def print_summary(seq_names, results_per_seq, results_for_all_seqs, column_width=14):
   metrics = [("sMOTSA", "sMOTSA"), ("MOTSA", "MOTSA"),
              ("MOTSP", "MOTSP"), ("MOTSAL", "MOTSAL"), ("MODSA", "MODSA"), ("MODSP", "MODSP"),
+             ("IDF1", "IDF1"),
              ("Recall", "recall"), ("Prec", "precision"), ("F1", "F1"), ("FAR", "FAR"),
              ("MT", "MT"), ("PT", "PT"), ("ML", "ML"),
              ("TP", "tp"), ("FP", "fp"), ("FN", "fn"),
@@ -394,3 +409,162 @@ def print_entry(key, val, width=(70, 10)):
   else:
     s_out += ("%s" % val).rjust(width[1])
   return s_out
+
+
+
+### IDF1 stuff
+### code below adapted from https://github.com/shenh10/mot_evaluation/blob/5dd51e5cb7b45992774ea150e4386aa0b02b586f/utils/measurements.py
+def compute_idf1_and_idtp_for_sequence(frame_to_gt, frame_to_pred, gt_ids, st_ids):
+  gt_ids = sorted(gt_ids)
+  st_ids = sorted(st_ids)
+  groundtruth = [[] for _ in gt_ids]
+  prediction = [[] for _ in st_ids]
+  for t, gts_t in frame_to_gt.items():
+    for gt_t in gts_t:
+      if gt_t.track_id in gt_ids:
+        groundtruth[gt_ids.index(gt_t.track_id)].append((t, gt_t))
+  for t, preds_t in frame_to_pred.items():
+    for pred_t in preds_t:
+      if pred_t.track_id in st_ids:
+        prediction[st_ids.index(pred_t.track_id)].append((t, pred_t))
+  for gt in groundtruth:
+    gt.sort(key=lambda x: x[0])
+  for pred in prediction:
+    pred.sort(key=lambda x: x[0])
+
+  n_gt = len(gt_ids)
+  n_st = len(st_ids)
+  cost = np.zeros((n_gt + n_st, n_st + n_gt), dtype=float)
+  cost[n_gt:, :n_st] = sys.maxsize  # float('inf')
+  cost[:n_gt, n_st:] = sys.maxsize  # float('inf')
+
+  fp = np.zeros(cost.shape)
+  fn = np.zeros(cost.shape)
+  # cost matrix of all trajectory pairs
+  cost_block, fp_block, fn_block = cost_between_gt_pred(groundtruth, prediction)
+  cost[:n_gt, :n_st] = cost_block
+  fp[:n_gt, :n_st] = fp_block
+  fn[:n_gt, :n_st] = fn_block
+
+  # computed trajectory match no groundtruth trajectory, FP
+  for i in range(n_st):
+    #cost[i + n_gt, i] = prediction[i].shape[0]
+    #fp[i + n_gt, i] = prediction[i].shape[0]
+    # TODO: don't count fp in case of ignore region?
+    cost[i + n_gt, i] = len(prediction[i])
+    fp[i + n_gt, i] = len(prediction[i])
+
+  # groundtruth trajectory match no computed trajectory, FN
+  for i in range(n_gt):
+    #cost[i, i + n_st] = groundtruth[i].shape[0]
+    #fn[i, i + n_st] = groundtruth[i].shape[0]
+    cost[i, i + n_st] = len(groundtruth[i])
+    fn[i, i + n_st] = len(groundtruth[i])
+  # TODO: add error handling here?
+  matched_indices = linear_assignment(cost)
+  #nbox_gt = sum([groundtruth[i].shape[0] for i in range(n_gt)])
+  #nbox_st = sum([prediction[i].shape[0] for i in range(n_st)])
+  nbox_gt = sum([len(groundtruth[i]) for i in range(n_gt)])
+  nbox_st = sum([len(prediction[i]) for i in range(n_st)])
+
+  IDFP = 0
+  IDFN = 0
+  for matched in zip(*matched_indices):
+    IDFP += fp[matched[0], matched[1]]
+    IDFN += fn[matched[0], matched[1]]
+  IDTP = nbox_gt - IDFN
+  assert IDTP == nbox_st - IDFP
+  #IDP = IDTP / (IDTP + IDFP) * 100  # IDP = IDTP / (IDTP + IDFP)
+  #IDR = IDTP / (IDTP + IDFN) * 100  # IDR = IDTP / (IDTP + IDFN)
+  # IDF1 = 2 * IDTP / (2 * IDTP + IDFP + IDFN)
+  IDF1 = 2 * IDTP / (nbox_gt + nbox_st)
+  return IDF1, IDTP
+
+
+def cost_between_gt_pred(groundtruth, prediction):
+  n_gt = len(groundtruth)
+  n_st = len(prediction)
+  cost = np.zeros((n_gt, n_st), dtype=float)
+  fp = np.zeros((n_gt, n_st), dtype=float)
+  fn = np.zeros((n_gt, n_st), dtype=float)
+  for i in range(n_gt):
+    for j in range(n_st):
+      fp[i, j], fn[i, j] = cost_between_trajectories(groundtruth[i], prediction[j])
+      cost[i, j] = fp[i, j] + fn[i, j]
+  return cost, fp, fn
+
+
+def cost_between_trajectories(traj1, traj2):
+  #[npoints1, dim1] = traj1.shape
+  #[npoints2, dim2] = traj2.shape
+  npoints1 = len(traj1)
+  npoints2 = len(traj2)
+  # find start and end frame of each trajectories
+  #start1 = traj1[0, 0]
+  #end1 = traj1[-1, 0]
+  #start2 = traj2[0, 0]
+  #end2 = traj2[-1, 0]
+  times1 = [x[0] for x in traj1]
+  times2 = [x[0] for x in traj2]
+  start1 = min(times1)
+  start2 = min(times2)
+  end1 = max(times1)
+  end2 = max(times2)
+
+  # check frame overlap
+  #has_overlap = max(start1, start2) < min(end1, end2)
+  # careful, changed this to <=, but I think now it's right
+  has_overlap = max(start1, start2) <= min(end1, end2)
+  if not has_overlap:
+    fn = npoints1
+    fp = npoints2
+    return fp, fn
+
+  # gt trajectory mapping to st, check gt missed
+  matched_pos1 = corresponding_frame(times1, npoints1, times2, npoints2)
+  # st trajectory mapping to gt, check computed one false alarms
+  matched_pos2 = corresponding_frame(times2, npoints2, times1, npoints1)
+  overlap1 = compute_overlap(traj1, traj2, matched_pos1)
+  overlap2 = compute_overlap(traj2, traj1, matched_pos2)
+  # FN
+  fn = sum([1 for i in range(npoints1) if overlap1[i] < 0.5])
+  # FP
+  # TODO: don't count false positive in case of ignore region?
+  fp = sum([1 for i in range(npoints2) if overlap2[i] < 0.5])
+  return fp, fn
+
+
+def corresponding_frame(traj1, len1, traj2, len2):
+  """
+  Find the matching position in traj2 regarding to traj1
+  Assume both trajectories in ascending frame ID
+  """
+  p1, p2 = 0, 0
+  loc = -1 * np.ones((len1,), dtype=int)
+  while p1 < len1 and p2 < len2:
+    if traj1[p1] < traj2[p2]:
+      loc[p1] = -1
+      p1 += 1
+    elif traj1[p1] == traj2[p2]:
+      loc[p1] = p2
+      p1 += 1
+      p2 += 1
+    else:
+      p2 += 1
+  return loc
+
+
+def compute_overlap(traj1, traj2, matched_pos):
+  """
+  Compute the loss hit in traj2 regarding to traj1
+  """
+  overlap = np.zeros((len(matched_pos),), dtype=float)
+  for i in range(len(matched_pos)):
+    if matched_pos[i] == -1:
+      continue
+    else:
+      mask1 = traj1[i][1].mask
+      mask2 = traj2[matched_pos[i]][1].mask
+      iou = rletools.iou([mask1], [mask2], [False])[0][0]
+      overlap[i] = iou
+  return overlap
