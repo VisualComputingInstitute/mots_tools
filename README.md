@@ -27,7 +27,7 @@ Parts of the evaluation logic are built upon the KITTI 2D tracking evaluation de
 ### Visualizing a tracking result
 Similarly to evaluating tracking results, you can also create visualizations using
 ```
-python mots_eval/visualize_mots.py tracking_results img_folder output_folder seqmap
+python mots_vis/visualize_mots.py tracking_results img_folder output_folder seqmap
 ```
 where "img_folder" is a folder containing the original KITTI tracking images (http://www.cvlibs.net/download.php?file=data_tracking_image_2.zip) and "output_folder" is a folder where the resulting visualization will be created.
 ## Citation
